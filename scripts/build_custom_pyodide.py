@@ -17,6 +17,7 @@ PYODIDE_URL = (
     f"pyodide-{PYODIDE_VERSION}.tar.bz2"
 )
 PYODIDE_SHA256 = "458e8ddbcbb6e21037d3237cd5c5146c451765bc738dfa2249ff34c5140331e4"
+PYODIDE_PYTHON_VERSION = "3.13"
 DEFAULT_REQUIREMENTS = Path("pyodide-extra-requirements.txt")
 REQUIRED_PACKAGES = {
     "numpy",
@@ -112,6 +113,14 @@ def download_wheels(requirements_file: Path, output_dir: Path) -> list[Path]:
         "--dest",
         str(wheel_dir),
         "--only-binary=:all:",
+        "--platform",
+        "any",
+        "--python-version",
+        PYODIDE_PYTHON_VERSION,
+        "--implementation",
+        "py",
+        "--abi",
+        "none",
         "--requirement",
         str(requirements_file),
     ]
@@ -122,8 +131,9 @@ def download_wheels(requirements_file: Path, output_dir: Path) -> list[Path]:
     non_portable = [wheel.name for wheel in wheels if not wheel.name.endswith("none-any.whl")]
     if non_portable:
         raise RuntimeError(
-            "Only pure-Python wheels are supported by this repo workflow. "
-            f"Unexpected wheels: {', '.join(non_portable)}"
+            "Only implementation-agnostic, platform-agnostic wheels are supported by "
+            "this repo workflow. Unexpected wheels: "
+            f"{', '.join(non_portable)}"
         )
     return wheels
 

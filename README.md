@@ -74,5 +74,6 @@ If you add packages that are not pure-Python wheels, this repo's current workflo
 ## Notes
 
 - The deployment workflow uses Python 3.13 because the pinned JupyterLite Pyodide kernel line targets Pyodide 0.29.x.
+- The custom Pyodide builder asks `pip download` for `--platform any --implementation py --abi none --python-version 3.13` so packages like `psygnal` resolve to universal `py3-none-any` wheels instead of host-specific Linux wheels.
 - The Pyodide assets are created during the GitHub Action run and are **not** committed into git.
 - The site remains static and GitHub Pages-friendly: no server process is required.
