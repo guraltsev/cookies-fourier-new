@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import shutil
 import subprocess
@@ -156,7 +157,22 @@ def download_wheels(requirements_file: Path, output_dir: Path) -> list[Path]:
     return wheels
 
 
+def validate_pyodide_cli_environment() -> None:
+    try:
+        importlib.import_module("wheel.cli.pack")
+    except ModuleNotFoundError as err:
+        if getattr(err, "name", None) != "wheel.cli":
+            raise
+        raise RuntimeError(
+            "The installed 'wheel' package is too new for pyodide-build "
+            f"{PYODIDE_VERSION}. Pyodide 0.29.3 still relies on the public "
+            "wheel.cli module, which newer wheel releases removed. "
+            "Install a compatible version such as 'wheel<0.46' before running this script."
+        ) from err
+
+
 def find_pyodide_cli() -> str:
+    validate_pyodide_cli_environment()
     pyodide_exe = shutil.which("pyodide")
     if not pyodide_exe:
         raise RuntimeError(
@@ -254,6 +270,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    validate_pyodide_cli_environment()
     archive = ensure_archive(args.cache_dir)
     extract_archive(archive, args.output_dir)
     wheels = download_wheels(args.requirements_file, args.output_dir)
