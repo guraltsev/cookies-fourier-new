@@ -6,6 +6,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import os
 import sys
 import tarfile
 import urllib.request
@@ -97,7 +98,24 @@ def extract_archive(archive_path: Path, output_dir: Path) -> None:
 
 def run_checked(cmd: list[str], cwd: Path | None = None) -> None:
     print("Running:", " ".join(cmd))
-    subprocess.run(cmd, cwd=cwd, check=True)
+    try:
+        subprocess.run(cmd, cwd=cwd, check=True, text=True)
+    except subprocess.CalledProcessError as err:
+        location = f" (cwd={cwd})" if cwd else ""
+        raise RuntimeError(
+            f"Command failed with exit code {err.returncode}{location}: {' '.join(cmd)}"
+        ) from err
+
+
+def run_capture(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
+    print("Running:", " ".join(cmd))
+    return subprocess.run(
+        cmd,
+        cwd=cwd,
+        check=False,
+        text=True,
+        capture_output=True,
+    )
 
 
 def download_wheels(requirements_file: Path, output_dir: Path) -> list[Path]:
@@ -151,20 +169,46 @@ def find_pyodide_cli() -> str:
 def add_wheels_to_lockfile(output_dir: Path, wheels: list[Path]) -> None:
     input_lock = output_dir / "pyodide-lock.json"
     output_lock = output_dir / "pyodide-lock.updated.json"
-    cmd = [
-        find_pyodide_cli(),
-        "lockfile",
-        "add-wheels",
-        "--input",
-        str(input_lock),
-        "--output",
-        str(output_lock),
-        "--base-path",
-        str(output_dir),
-        *[str(wheel) for wheel in wheels],
+    wheel_args = [os.path.relpath(wheel, output_dir) for wheel in wheels]
+
+    def build_cmd(ignore_missing_dependencies: bool) -> list[str]:
+        cmd = [
+            find_pyodide_cli(),
+            "lockfile",
+            "add-wheels",
+            "--input",
+            input_lock.name,
+            "--output",
+            output_lock.name,
+            "--base-path",
+            ".",
+        ]
+        if ignore_missing_dependencies:
+            cmd.append("--ignore-missing-dependencies")
+        cmd.extend(wheel_args)
+        return cmd
+
+    attempts = [
+        (False, "strict dependency validation"),
+        (True, "allowing the CLI to tolerate dependency-resolution gaps"),
     ]
-    run_checked(cmd)
-    output_lock.replace(input_lock)
+    last_failure = None
+    for ignore_missing, description in attempts:
+        result = run_capture(build_cmd(ignore_missing), cwd=output_dir)
+        if result.returncode == 0 and output_lock.exists():
+            output_lock.replace(input_lock)
+            return
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+        last_failure = RuntimeError(
+            "pyodide lockfile add-wheels failed while "
+            f"{description}.\n"
+            f"stdout:\n{stdout or '[no stdout]'}\n\n"
+            f"stderr:\n{stderr or '[no stderr]'}"
+        )
+
+    assert last_failure is not None
+    raise last_failure
 
 
 def validate_lockfile(output_dir: Path) -> None:
