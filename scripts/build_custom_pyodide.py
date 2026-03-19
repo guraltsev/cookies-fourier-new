@@ -3,15 +3,15 @@ from __future__ import annotations
 
 import argparse
 import hashlib
-import importlib
 import json
 import shutil
 import subprocess
-import os
 import sys
 import tarfile
 import urllib.request
 from pathlib import Path
+
+from packaging.utils import InvalidWheelFilename, canonicalize_name, parse_wheel_filename
 
 PYODIDE_VERSION = "0.29.3"
 PYODIDE_URL = (
@@ -40,10 +40,12 @@ def sha256sum(path: Path) -> str:
     return digest.hexdigest()
 
 
+
 def download_file(url: str, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     with urllib.request.urlopen(url) as response, destination.open("wb") as handle:
         shutil.copyfileobj(response, handle)
+
 
 
 def ensure_archive(cache_dir: Path) -> Path:
@@ -64,6 +66,7 @@ def ensure_archive(cache_dir: Path) -> Path:
     return archive
 
 
+
 def flatten_extracted_tree(output_dir: Path) -> None:
     if (output_dir / "pyodide.js").exists():
         return
@@ -79,6 +82,7 @@ def flatten_extracted_tree(output_dir: Path) -> None:
     for child in inner.iterdir():
         shutil.move(str(child), output_dir / child.name)
     inner.rmdir()
+
 
 
 def extract_archive(archive_path: Path, output_dir: Path) -> None:
@@ -97,26 +101,11 @@ def extract_archive(archive_path: Path, output_dir: Path) -> None:
             raise RuntimeError(f"Missing required Pyodide asset: {required}")
 
 
+
 def run_checked(cmd: list[str], cwd: Path | None = None) -> None:
     print("Running:", " ".join(cmd))
-    try:
-        subprocess.run(cmd, cwd=cwd, check=True, text=True)
-    except subprocess.CalledProcessError as err:
-        location = f" (cwd={cwd})" if cwd else ""
-        raise RuntimeError(
-            f"Command failed with exit code {err.returncode}{location}: {' '.join(cmd)}"
-        ) from err
+    subprocess.run(cmd, cwd=cwd, check=True)
 
-
-def run_capture(cmd: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
-    print("Running:", " ".join(cmd))
-    return subprocess.run(
-        cmd,
-        cwd=cwd,
-        check=False,
-        text=True,
-        capture_output=True,
-    )
 
 
 def download_wheels(requirements_file: Path, output_dir: Path) -> list[Path]:
@@ -157,22 +146,8 @@ def download_wheels(requirements_file: Path, output_dir: Path) -> list[Path]:
     return wheels
 
 
-def validate_pyodide_cli_environment() -> None:
-    try:
-        importlib.import_module("wheel.cli.pack")
-    except ModuleNotFoundError as err:
-        if getattr(err, "name", None) != "wheel.cli":
-            raise
-        raise RuntimeError(
-            "The installed 'wheel' package is too new for pyodide-build "
-            f"{PYODIDE_VERSION}. Pyodide 0.29.3 still relies on the public "
-            "wheel.cli module, which newer wheel releases removed. "
-            "Install a compatible version such as 'wheel<0.46' before running this script."
-        ) from err
-
 
 def find_pyodide_cli() -> str:
-    validate_pyodide_cli_environment()
     pyodide_exe = shutil.which("pyodide")
     if not pyodide_exe:
         raise RuntimeError(
@@ -182,49 +157,109 @@ def find_pyodide_cli() -> str:
     return pyodide_exe
 
 
-def add_wheels_to_lockfile(output_dir: Path, wheels: list[Path]) -> None:
+
+def lockfile_package_names(lockfile: Path) -> set[str]:
+    data = json.loads(lockfile.read_text(encoding="utf-8"))
+    return {canonicalize_name(name) for name in data.get("packages", {})}
+
+
+
+def wheel_distribution_name(path: Path) -> str:
+    try:
+        name, _, _, _ = parse_wheel_filename(path.name)
+    except InvalidWheelFilename:
+        stem_parts = path.stem.split("-")
+        if not stem_parts:
+            raise RuntimeError(f"Could not determine distribution name for wheel {path}")
+        name = stem_parts[0]
+    return canonicalize_name(name)
+
+
+
+def prune_wheels_already_in_lockfile(output_dir: Path, wheels: list[Path]) -> list[Path]:
+    """Keep only wheels for packages that are not already bundled in upstream Pyodide.
+
+    The upstream 0.29.3 lockfile already contains many pure-Python packages such as
+    IPython, traitlets, prompt_toolkit, packaging, narwhals, and their dependencies.
+    Replacing them with freshly downloaded wheels is unnecessary and can create a much
+    larger, more fragile lockfile solve.
+    """
+
+    existing_packages = lockfile_package_names(output_dir / "pyodide-lock.json")
+    kept: list[Path] = []
+    reused: list[tuple[str, Path]] = []
+
+    for wheel in wheels:
+        distribution_name = wheel_distribution_name(wheel)
+        if distribution_name in existing_packages:
+            reused.append((distribution_name, wheel))
+            continue
+        kept.append(wheel)
+
+    if reused:
+        reused_names = sorted({name for name, _ in reused})
+        print(
+            "Reusing packages already present in upstream pyodide-lock.json instead of "
+            "replacing them with downloaded wheels: "
+            + ", ".join(reused_names)
+        )
+        for _, wheel in reused:
+            wheel.unlink(missing_ok=True)
+
+    if kept:
+        print(
+            "Additional wheels to merge into the custom Pyodide lockfile: "
+            + ", ".join(wheel.name for wheel in kept)
+        )
+    else:
+        print("No extra wheels need to be merged; upstream Pyodide already provides them.")
+
+    return kept
+
+
+
+def add_wheels_to_lockfile_via_api(output_dir: Path, wheels: list[Path]) -> None:
+    from pyodide_lock import PyodideLockSpec
+    from pyodide_lock.utils import add_wheels_to_spec
+
     input_lock = output_dir / "pyodide-lock.json"
     output_lock = output_dir / "pyodide-lock.updated.json"
-    wheel_args = [os.path.relpath(wheel, output_dir) for wheel in wheels]
+    lock_spec = PyodideLockSpec.from_json(input_lock)
+    updated_lock_spec = add_wheels_to_spec(lock_spec, wheels, base_path=output_dir)
+    updated_lock_spec.to_json(output_lock)
+    output_lock.replace(input_lock)
 
-    def build_cmd(ignore_missing_dependencies: bool) -> list[str]:
-        cmd = [
-            find_pyodide_cli(),
-            "lockfile",
-            "add-wheels",
-            "--input",
-            input_lock.name,
-            "--output",
-            output_lock.name,
-            "--base-path",
-            ".",
-        ]
-        if ignore_missing_dependencies:
-            cmd.append("--ignore-missing-dependencies")
-        cmd.extend(wheel_args)
-        return cmd
 
-    attempts = [
-        (False, "strict dependency validation"),
-        (True, "allowing the CLI to tolerate dependency-resolution gaps"),
-    ]
-    last_failure = None
-    for ignore_missing, description in attempts:
-        result = run_capture(build_cmd(ignore_missing), cwd=output_dir)
-        if result.returncode == 0 and output_lock.exists():
-            output_lock.replace(input_lock)
-            return
-        stdout = (result.stdout or "").strip()
-        stderr = (result.stderr or "").strip()
-        last_failure = RuntimeError(
-            "pyodide lockfile add-wheels failed while "
-            f"{description}.\n"
-            f"stdout:\n{stdout or '[no stdout]'}\n\n"
-            f"stderr:\n{stderr or '[no stderr]'}"
+
+def add_wheels_to_lockfile(output_dir: Path, wheels: list[Path]) -> None:
+    if not wheels:
+        return
+    try:
+        add_wheels_to_lockfile_via_api(output_dir, wheels)
+        return
+    except ImportError:
+        print(
+            "pyodide_lock Python API is not importable in this environment; falling back "
+            "to the pyodide CLI."
         )
 
-    assert last_failure is not None
-    raise last_failure
+    input_lock = output_dir / "pyodide-lock.json"
+    output_lock = output_dir / "pyodide-lock.updated.json"
+    cmd = [
+        find_pyodide_cli(),
+        "lockfile",
+        "add-wheels",
+        "--input",
+        str(input_lock),
+        "--output",
+        str(output_lock),
+        "--base-path",
+        str(output_dir),
+        *[str(wheel) for wheel in wheels],
+    ]
+    run_checked(cmd)
+    output_lock.replace(input_lock)
+
 
 
 def validate_lockfile(output_dir: Path) -> None:
@@ -238,6 +273,7 @@ def validate_lockfile(output_dir: Path) -> None:
             + ", ".join(missing)
         )
     print("Validated pyodide-lock.json contains:", ", ".join(sorted(REQUIRED_PACKAGES)))
+
 
 
 def parse_args() -> argparse.Namespace:
@@ -268,12 +304,13 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+
 def main() -> int:
     args = parse_args()
-    validate_pyodide_cli_environment()
     archive = ensure_archive(args.cache_dir)
     extract_archive(archive, args.output_dir)
     wheels = download_wheels(args.requirements_file, args.output_dir)
+    wheels = prune_wheels_already_in_lockfile(args.output_dir, wheels)
     add_wheels_to_lockfile(args.output_dir, wheels)
     validate_lockfile(args.output_dir)
     print(f"Custom Pyodide distribution written to {args.output_dir}")

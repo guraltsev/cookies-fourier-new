@@ -118,4 +118,4 @@ dmypy.json
 # jupyterlite
 *.doit.db
 _output
-/.vscode/settings.json
+/.vscode

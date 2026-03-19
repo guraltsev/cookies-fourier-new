@@ -23,6 +23,7 @@ Extra packages can still be installed from inside a notebook with `%pip install 
   1. the JupyterLite site itself
   2. a modified, self-hosted Pyodide distribution under `dist/pyodide`
 - The deployed JupyterLite runtime is patched to point at that bundled Pyodide distribution.
+- The custom Pyodide builder now reuses packages already present in the upstream Pyodide lockfile instead of replacing them with redundant downloaded wheels.
 - The Fourier notebooks no longer tell users to run `%pip install ...` before getting started.
 
 ## Repo layout
